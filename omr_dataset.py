@@ -1,5 +1,4 @@
 import tensorflow as tf
-import matplotlib.pyplot as plt
 
 class OMRDataset:
     def parse(example: tf.Tensor):
@@ -17,7 +16,7 @@ class OMRDataset:
     def __init__(self) -> None:
         self._train_size: int = 73066
         self._dev_size: int = 7307
-        self._test_size: int =  7307
+        self._test_size: int =  7305
 
         self.train: tf.data.Dataset = tf.data.TFRecordDataset('train.tfrecord').map(OMRDataset.parse).apply(
             tf.data.experimental.assert_cardinality(self._train_size))
@@ -26,19 +25,11 @@ class OMRDataset:
         self.test: tf.data.Dataset = tf.data.TFRecordDataset('test.tfrecord').map(OMRDataset.parse).apply(
             tf.data.experimental.assert_cardinality(self._test_size))
 
-if __name__ == "__main__":
-    omr = OMRDataset()
-    imgs = []
-    labels = []
-    for example in omr.train.take(5):
-        imgs.append(example["image"])
-        labels.append(example["label"])
+    class EditDistanceMetric(tf.metrics.Mean):
+            def __init__(self, name: str = "edit_distance", dtype = None) -> None:
+                super().__init__(name, dtype)
 
-    _, axs = plt.subplots(5, 1, figsize=(12, 12))
-    axs = axs.flatten()
+            def update_state(self, y_true: tf.RaggedTensor, y_pred: tf.RaggedTensor, sample_weight = None) -> None:
 
-    for img, title, ax in zip(imgs, labels, axs):
-        ax.axis('off')
-        ax.imshow(img, cmap='afmhot')
-        ax.set_title(' '.join([symbol for symbol in title.numpy()]))
-    plt.show()
+                edit_distances = tf.edit_distance(y_pred.to_sparse(), y_true.to_sparse(), normalize=True)
+                return super().update_state(edit_distances, sample_weight)

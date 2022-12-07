@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
-import functools
 import os
 import re
-import sys
 
-import numpy as np
 import tensorflow as tf
+
+COLAB = False
+if COLAB:
+    import sys
+    from google.colab import drive
+    drive.mount('/content/drive')
+    sys.path.insert(0,'/content/drive/MyDrive/Colab Notebooks')
+    os.chdir('/content/drive/MyDrive/Colab Notebooks/')
+
+from omr_dataset import OMRDataset
+from vocabulary_semantic import SYMBOL_LIST
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-# TODO:
-#from omr_dataset import OMRDataset
-
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", default=64, type=int, help="Batch size.")
+parser.add_argument("--batch_size", default=48, type=int, help="Batch size.")
 parser.add_argument("--epochs", default=10, type=int, help="Number of epochs.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
 parser.add_argument("--threads", default=0, type=int, help="Maximum number of threads to use.")
@@ -31,37 +36,36 @@ class Model(tf.keras.Model):
         hidden = tf.keras.layers.BatchNormalization()(hidden)
         hidden = tf.keras.layers.ReLU()(hidden)
         hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-        hidden = tf.keras.layers.Dropout(0.4)(hidden)
 
         hidden = tf.keras.layers.Conv2D(64, 3, activation=None, padding="same")(hidden)
         hidden = tf.keras.layers.BatchNormalization()(hidden)
         hidden = tf.keras.layers.ReLU()(hidden)
         hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-        hidden = tf.keras.layers.Dropout(0.4)(hidden)
 
         hidden = tf.keras.layers.Conv2D(128, 3, activation=None, padding="same")(hidden)
         hidden = tf.keras.layers.BatchNormalization()(hidden)
         hidden = tf.keras.layers.ReLU()(hidden)
         hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-        hidden = tf.keras.layers.Dropout(0.4)(hidden)
 
         hidden = tf.keras.layers.Conv2D(128, 3, activation=None, padding="same")(hidden)
         hidden = tf.keras.layers.BatchNormalization()(hidden)
         hidden = tf.keras.layers.ReLU()(hidden)
         hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-        hidden = tf.keras.layers.Dropout(0.4)(hidden)
+        
 
         hidden = tf.keras.layers.Lambda(lambda x: tf.transpose(x, perm=[0, 2, 1, 3]))(hidden)
         new_shape = (IMAGE_WIDTH // 16, (IMAGE_HEIGHT // 16) * 128)
         hidden = tf.keras.layers.Reshape(new_shape)(hidden)
 
+        hidden = tf.keras.layers.Dropout(0.3)(hidden)
+
         hidden = tf.keras.layers.Bidirectional(
           tf.keras.layers.LSTM(512, return_sequences=True)
         )(hidden)
         
-        hidden = tf.keras.layers.Dropout(0.5)(hidden)
+        hidden = tf.keras.layers.Dropout(0.3)(hidden)
 
-        logits = tf.keras.layers.Dense(1 + len(OMRDataset.MARKS), activation=None)(hidden)
+        logits = tf.keras.layers.Dense(1 + len(SYMBOL_LIST), activation=None)(hidden)
 
         super().__init__(inputs=inputs, outputs=logits)
 
@@ -138,42 +142,31 @@ def main(args: argparse.Namespace) -> None:
         ",".join(("{}={}".format(re.sub("(.)[^_]*_?", r"\1", k), v) for k, v in sorted(vars(args).items())))
     ))
 
-
     omr = OMRDataset()
-
-    # based on https://keras.io/examples/vision/handwriting_recognition/
-    def resize_image(image):
-        image = tf.image.resize_with_pad(image, target_height=IMAGE_HEIGHT, target_width=IMAGE_WIDTH)
-        
-        return image
 
     def create_dataset(name):
         def prepare_example(example):
-            new_input = resize_image(example["image"])
-            mark = example["marks"]
-            return new_input, mark
+            image = tf.image.resize_with_pad(example["image"], target_height=IMAGE_HEIGHT, target_width=IMAGE_WIDTH)
+            return image, example["label"]
 
-        dataset = getattr(omr, name).map(prepare_example)
-        dataset = dataset.shuffle(200, seed=args.seed) if name == "train" else dataset
+        dataset = getattr(omr, name)
+        dataset = dataset.shuffle(1000, seed=args.seed) if name == "train" else dataset
+        dataset = dataset.map(prepare_example)
         dataset = dataset.apply(tf.data.experimental.dense_to_ragged_batch(args.batch_size))
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
         return dataset
 
-    def create_test():
-        def prepare_example(example):
-            new_input = resize_image(example["image"])
-            return new_input
-
-        dataset = getattr(omr, "test").map(prepare_example)
-        dataset = dataset.apply(tf.data.experimental.dense_to_ragged_batch(args.batch_size))
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
-        return dataset
-
-    train, dev, test = create_dataset("train"), create_dataset("dev"), create_test()
+    train, dev, test = create_dataset("train"), create_dataset("dev"), create_dataset("test")
 
     model = Model(args)
     model.summary()
-    logs = model.fit(train, epochs=args.epochs, validation_data=dev, callbacks=[model.tb_callback])
+    model.fit(train, epochs=args.epochs, validation_data=dev, callbacks=[model.tb_callback])
+
+    with open(os.path.join(args.logdir, "omr_result.txt"), "w", encoding="utf-8") as predictions_file:
+        predictions = model.predict(test)
+
+        for sequence in predictions:
+            print(" ".join(SYMBOL_LIST[mark] for mark in sequence), file=predictions_file)
 
 if __name__ == "__main__":
     args = parser.parse_args([] if "__file__" not in globals() else None)
