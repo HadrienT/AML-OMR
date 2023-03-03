@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import datetime
 import os
-import re
-
+import numpy as np
 import tensorflow as tf
+import uuid
 
+# for running in COLAB environment
 COLAB = False
 if COLAB:
     import sys
@@ -23,48 +23,41 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", default=48, type=int, help="Batch size.")
 parser.add_argument("--epochs", default=10, type=int, help="Number of epochs.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
-parser.add_argument("--threads", default=0, type=int, help="Maximum number of threads to use.")
 
+# estimated from the examples
 IMAGE_HEIGHT = 100
 IMAGE_WIDTH = 1710
+
+maxpools = [2, 2, 2, 2]
+conv_filters = [64, 64, 128, 128]
+assert len(maxpools) == len(conv_filters)
 
 class Model(tf.keras.Model):
     def __init__(self, args: argparse.Namespace) -> None:
         inputs = tf.keras.layers.Input(shape=[IMAGE_HEIGHT, IMAGE_WIDTH, 1], dtype=tf.float32)
 
-        hidden = tf.keras.layers.Conv2D(64, 3, activation=None, padding="same")(inputs)
-        hidden = tf.keras.layers.BatchNormalization()(hidden)
-        hidden = tf.keras.layers.ReLU()(hidden)
-        hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
+        # craete block with convolution, batchnorm, relu and maxpool
+        for block_index in range(len(conv_filters)):
+            hidden = tf.keras.layers.Conv2D(conv_filters[block_index], 3, activation=None, padding="same")(inputs if block_index == 0 else hidden)
+            hidden = tf.keras.layers.BatchNormalization()(hidden)
+            hidden = tf.keras.layers.ReLU()(hidden)
+            hidden = tf.keras.layers.MaxPool2D((maxpools[block_index], maxpools[block_index]))(hidden)
 
-        hidden = tf.keras.layers.Conv2D(64, 3, activation=None, padding="same")(hidden)
-        hidden = tf.keras.layers.BatchNormalization()(hidden)
-        hidden = tf.keras.layers.ReLU()(hidden)
-        hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-
-        hidden = tf.keras.layers.Conv2D(128, 3, activation=None, padding="same")(hidden)
-        hidden = tf.keras.layers.BatchNormalization()(hidden)
-        hidden = tf.keras.layers.ReLU()(hidden)
-        hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-
-        hidden = tf.keras.layers.Conv2D(128, 3, activation=None, padding="same")(hidden)
-        hidden = tf.keras.layers.BatchNormalization()(hidden)
-        hidden = tf.keras.layers.ReLU()(hidden)
-        hidden = tf.keras.layers.MaxPool2D((2, 2))(hidden)
-        
-
+        # change order of dimensions for correct connection to RNN
         hidden = tf.keras.layers.Lambda(lambda x: tf.transpose(x, perm=[0, 2, 1, 3]))(hidden)
-        new_shape = (IMAGE_WIDTH // 16, (IMAGE_HEIGHT // 16) * 128)
-        hidden = tf.keras.layers.Reshape(new_shape)(hidden)
+        new_shape = (IMAGE_WIDTH // np.prod(maxpools), (IMAGE_WIDTH // np.prod(maxpools)) * conv_filters[-1])
 
+        hidden = tf.keras.layers.Reshape(new_shape)(hidden)
         hidden = tf.keras.layers.Dropout(0.3)(hidden)
 
+        # RNN
         hidden = tf.keras.layers.Bidirectional(
           tf.keras.layers.LSTM(512, return_sequences=True)
         )(hidden)
         
         hidden = tf.keras.layers.Dropout(0.3)(hidden)
 
+        # generate logits for CTC, +1 for blank symbol
         logits = tf.keras.layers.Dense(1 + len(SYMBOL_LIST), activation=None)(hidden)
 
         super().__init__(inputs=inputs, outputs=logits)
@@ -74,6 +67,8 @@ class Model(tf.keras.Model):
                      metrics=[OMRDataset.EditDistanceMetric()])
 
         self.tb_callback = tf.keras.callbacks.TensorBoard(args.logdir)
+
+    # making out ctc loss/decodes functions so that we can use ragged tensors
 
     def ctc_loss(self, gold_labels, logits):
         
@@ -107,6 +102,8 @@ class Model(tf.keras.Model):
         assert isinstance(predictions, tf.RaggedTensor), "CTC predictions must be RaggedTensors"
         return predictions
 
+    # overriding train/test/prediction steps so that training is faster (ctc decoding just on test and predictions)
+
     def train_step(self, data):
         x, y = data
         with tf.GradientTape() as tape:
@@ -132,18 +129,14 @@ class Model(tf.keras.Model):
 def main(args: argparse.Namespace) -> None:
 
     tf.keras.utils.set_random_seed(args.seed)
-    tf.config.threading.set_inter_op_parallelism_threads(args.threads)
-    tf.config.threading.set_intra_op_parallelism_threads(args.threads)
 
-
-    args.logdir = os.path.join("logs", "{}-{}-{}".format(
-        os.path.basename(globals().get("__file__", "notebook")),
-        datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S"),
-        ",".join(("{}={}".format(re.sub("(.)[^_]*_?", r"\1", k), v) for k, v in sorted(vars(args).items())))
-    ))
+    experiment_id = uuid.uuid4()
+    print(f"Current experiment id: {experiment_id}")
+    args.logdir = os.path.join("logs_", f"{experiment_id}")
 
     omr = OMRDataset()
-
+    
+    # prepare datasets
     def create_dataset(name):
         def prepare_example(example):
             image = tf.image.resize_with_pad(example["image"], target_height=IMAGE_HEIGHT, target_width=IMAGE_WIDTH)
@@ -162,6 +155,7 @@ def main(args: argparse.Namespace) -> None:
     model.summary()
     model.fit(train, epochs=args.epochs, validation_data=dev, callbacks=[model.tb_callback])
 
+    # make predictions for test dataset
     with open(os.path.join(args.logdir, "omr_result.txt"), "w", encoding="utf-8") as predictions_file:
         predictions = model.predict(test)
 
